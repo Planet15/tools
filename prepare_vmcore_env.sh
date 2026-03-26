@@ -74,11 +74,105 @@ find_latest_vmcore() {
         | cut -d' ' -f2-
 }
 
-log "[0/5] Checking environment..."
+fetch_url() {
+    local url="$1"
 
-for cmd in strings wget rpm2cpio cpio crash find sort; do
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url"
+    else
+        wget -qO- "$url"
+    fi
+}
+
+url_exists() {
+    local url="$1"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsI "$url" >/dev/null 2>&1
+    else
+        wget --spider -q "$url" >/dev/null 2>&1
+    fi
+}
+
+download_file() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL "$url" -o "$output"
+    else
+        wget -O "$output" "$url"
+    fi
+}
+
+detect_kernel_flavor() {
+    local os_release="$1"
+
+    if [[ "$os_release" == *uek* ]]; then
+        echo "uek"
+    else
+        echo "rhck"
+    fi
+}
+
+find_debuginfo_rpms() {
+    local os_release="$2"
+    local kernel_flavor="$3"
+    local arch
+    local base_release
+    local candidates=()
+
+    arch="${os_release##*.}"
+
+    if [ "$kernel_flavor" = "uek" ]; then
+        candidates+=("kernel-uek-debuginfo-${os_release}.rpm")
+    else
+        candidates+=("kernel-debuginfo-${os_release}.rpm")
+        candidates+=("kernel-debuginfo-common-${arch}-${os_release}.rpm")
+
+        base_release=$(echo "$os_release" | sed -E 's/\.el[0-9][^ ]*$//')
+        candidates+=("kernel-debuginfo-${base_release}.rpm")
+        candidates+=("kernel-debuginfo-common-${arch}-${base_release}.rpm")
+        candidates+=("kernel-debuginfo-${base_release}"*.rpm)
+        candidates+=("kernel-debuginfo-common-${arch}-${base_release}"*.rpm)
+    fi
+
+    printf '%s\n' "${candidates[@]}" | awk '!seen[$0]++'
+}
+
+resolve_existing_debuginfo_rpms() {
+    local debuginfo_url="$1"
+    shift
+    local candidate
+    local resolved=()
+
+    for candidate in "$@"; do
+        if [[ "$candidate" == *"*"* ]]; then
+            local html
+            local matched
+
+            html=$(fetch_url "$debuginfo_url")
+            matched=$(echo "$html" | grep -oE 'kernel(-uek)?-debuginfo[^"'"'"' >]*\.rpm|kernel-debuginfo-common[^"'"'"' >]*\.rpm' | grep -E "^${candidate//./\\.}$" | sort -uV | tail -1 || true)
+            if [ -n "$matched" ]; then
+                resolved+=("$matched")
+            fi
+        elif url_exists "${debuginfo_url}${candidate}"; then
+            resolved+=("$candidate")
+        fi
+    done
+
+    printf '%s\n' "${resolved[@]}" | awk '!seen[$0]++'
+}
+
+log "[0/6] Checking environment..."
+
+for cmd in strings rpm2cpio cpio crash find sort grep; do
     command -v "$cmd" >/dev/null 2>&1 || fail "Required command not found: $cmd"
 done
+
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    fail "Required command not found: curl or wget"
+fi
 
 mkdir -p "$WORKSPACE_DIR"
 [ -w "$WORKSPACE_DIR" ] || fail "No write permission in workspace: $WORKSPACE_DIR"
@@ -86,7 +180,7 @@ mkdir -p "$WORKSPACE_DIR"
 TARGET_VMCORE="${WORKSPACE_DIR}/vmcore"
 SELECTED_VMCORE=""
 
-log "[1/5] Preparing vmcore in workspace..."
+log "[1/6] Preparing vmcore in workspace..."
 
 if [ -n "$VMCORE_OVERRIDE" ]; then
     [ -f "$VMCORE_OVERRIDE" ] || fail "Specified vmcore does not exist: $VMCORE_OVERRIDE"
@@ -107,11 +201,13 @@ fi
 
 cd "$WORKSPACE_DIR"
 
-log "[2/5] Extracting OSRELEASE from vmcore..."
+log "[2/6] Extracting OSRELEASE from vmcore..."
 OS_RELEASE=$(strings vmcore | grep -m 1 -E "OSRELEASE=[0-9]" | cut -d'=' -f2 || true)
 [ -n "$OS_RELEASE" ] || fail "Could not extract OSRELEASE from vmcore."
 
 echo "Detected OSRELEASE: $OS_RELEASE"
+KERNEL_FLAVOR=$(detect_kernel_flavor "$OS_RELEASE")
+echo "Detected kernel flavor: $KERNEL_FLAVOR"
 
 case "$OS_RELEASE" in
     *.el5*) OL_PATH="ol5" ;;
@@ -123,22 +219,36 @@ case "$OS_RELEASE" in
     *) fail "Unsupported OSRELEASE: $OS_RELEASE" ;;
 esac
 
-log "[3/5] Downloading debuginfo RPM..."
-RPM_NAME="kernel-uek-debuginfo-${OS_RELEASE}.rpm"
+log "[3/6] Finding matching debuginfo RPM..."
 BASE_URL="https://oss.oracle.com"
-FULL_URL="${BASE_URL}/${OL_PATH}/debuginfo/${RPM_NAME}"
+DEBUGINFO_URL="${BASE_URL}/${OL_PATH}/debuginfo/"
+mapfile -t DEBUGINFO_CANDIDATES < <(find_debuginfo_rpms "$DEBUGINFO_URL" "$OS_RELEASE" "$KERNEL_FLAVOR")
+mapfile -t DEBUGINFO_RPMS < <(resolve_existing_debuginfo_rpms "$DEBUGINFO_URL" "${DEBUGINFO_CANDIDATES[@]}")
 
-echo "Download URL: ${FULL_URL}"
-wget -nc "$FULL_URL" || fail "RPM download failed."
+[ "${#DEBUGINFO_RPMS[@]}" -gt 0 ] || fail "No matching ${KERNEL_FLAVOR} debuginfo RPM found for ${OS_RELEASE} at ${DEBUGINFO_URL}"
 
-log "[4/5] Extracting vmlinux..."
+for rpm_name in "${DEBUGINFO_RPMS[@]}"; do
+    echo "Matched debuginfo RPM: ${rpm_name}"
+done
+
+log "[4/6] Downloading debuginfo RPM..."
+for rpm_name in "${DEBUGINFO_RPMS[@]}"; do
+    if [ ! -f "$rpm_name" ]; then
+        download_file "${DEBUGINFO_URL}${rpm_name}" "$rpm_name" || fail "RPM download failed: ${rpm_name}"
+    fi
+done
+
+log "[5/6] Extracting vmlinux..."
 VMLINUX_PATH="./usr/lib/debug/lib/modules/${OS_RELEASE}/vmlinux"
-rpm2cpio "$RPM_NAME" | cpio -idm "$VMLINUX_PATH" >/dev/null 2>&1 || true
+
+for rpm_name in "${DEBUGINFO_RPMS[@]}"; do
+    rpm2cpio "$rpm_name" | cpio -idm "$VMLINUX_PATH" >/dev/null 2>&1 || true
+done
 
 [ -f "$VMLINUX_PATH" ] || fail "vmlinux extraction failed or path is incorrect: $VMLINUX_PATH"
 
 echo "vmlinux: $VMLINUX_PATH"
 echo "vmcore : $(pwd)/vmcore"
 
-log "[5/5] Starting crash..."
+log "[6/6] Starting crash..."
 exec crash "$VMLINUX_PATH" vmcore
