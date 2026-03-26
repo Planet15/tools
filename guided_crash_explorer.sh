@@ -269,7 +269,9 @@ EOF
     rm -rf "$build_output_dir"
     cp -a "$built_dir" "$build_output_dir"
 
-    [ "$shim_created" = "on" ] && rm -f "$shim_path"
+    if [ "$shim_created" = "on" ]; then
+        rm -f "$shim_path"
+    fi
 }
 
 find_vmlinux_relpath_in_rpm() {
