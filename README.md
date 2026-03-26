@@ -14,6 +14,7 @@
 현재 포함된 항목:
 
 - `down_srpm.sh`: Oracle Linux SRPM을 찾아 다운로드하고, SPEC 확인 및 `rpmbuild -bp` 기반 소스 추출/빌드를 돕는 스크립트
+- `prepare_vmcore_env.sh`: `/var/crash` 아래의 최신 `vmcore`를 찾아 `~/vmcore_analysis`에 분석 환경을 준비하고 `crash`를 실행하는 스크립트
 
 ## 방향
 
