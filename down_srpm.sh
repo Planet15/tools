@@ -94,8 +94,9 @@ if [ "$CHANGELOG_ONLY" = "on" ] && [ -z "$CHANGELOG_TERM" ]; then
     exit 1
 fi
 
-# 입력 정리 (.rpm 제거 + 아키텍처 접미사 제거)
-NORMALIZED_INPUT="${PACKAGE_FILE%.rpm}"
+# 입력 정리 (.src.rpm/.rpm 제거 + 아키텍처 접미사 제거)
+NORMALIZED_INPUT="${PACKAGE_FILE%.src.rpm}"
+NORMALIZED_INPUT="${NORMALIZED_INPUT%.rpm}"
 NORMALIZED_INPUT=$(echo "$NORMALIZED_INPUT" | sed -E 's/\.(x86_64|aarch64|noarch|i686|i386|ppc64le|s390x)$//')
 
 PACKAGE_NAME=""
@@ -181,6 +182,39 @@ case $EL_VERSION in
         ;;
 esac
 
+SEARCH_INDEX_PAGES=()
+if [ "$EL_VERSION" = "5" ] && [[ "$PACKAGE_BASENAME" == kernel-uek* ]]; then
+    SEARCH_INDEX_PAGES=(
+        "https://yum.oracle.com/repo/OracleLinux/OL5/UEK/latest/x86_64/index_src.html"
+    )
+elif [ "$EL_VERSION" = "6" ] && [[ "$PACKAGE_BASENAME" == kernel-uek* ]]; then
+    SEARCH_INDEX_PAGES=(
+        "https://yum.oracle.com/repo/OracleLinux/OL6/UEKR4/x86_64/index_src.html"
+        "https://yum.oracle.com/repo/OracleLinux/OL6/UEKR3/latest/x86_64/index_src.html"
+        "https://yum.oracle.com/repo/OracleLinux/OL6/UEK/latest/x86_64/index_src.html"
+    )
+elif [ "$EL_VERSION" = "7" ] && [[ "$PACKAGE_BASENAME" == kernel-uek* ]]; then
+    SEARCH_INDEX_PAGES=(
+        "https://yum.oracle.com/repo/OracleLinux/OL7/UEKR6/x86_64/index_src.html"
+        "https://yum.oracle.com/repo/OracleLinux/OL7/UEKR5/x86_64/index_src.html"
+        "https://yum.oracle.com/repo/OracleLinux/OL7/UEKR4/x86_64/index_src.html"
+    )
+elif [ "$EL_VERSION" = "8" ] && [[ "$PACKAGE_BASENAME" == kernel-uek* ]]; then
+    SEARCH_INDEX_PAGES=(
+        "https://yum.oracle.com/repo/OracleLinux/OL8/UEKR7/x86_64/index_src.html"
+        "https://yum.oracle.com/repo/OracleLinux/OL8/UEKR6/x86_64/index_src.html"
+    )
+elif [ "$EL_VERSION" = "9" ] && [[ "$PACKAGE_BASENAME" == kernel-uek* ]]; then
+    SEARCH_INDEX_PAGES=(
+        "https://yum.oracle.com/repo/OracleLinux/OL9/UEKR8/x86_64/index_src.html"
+        "https://yum.oracle.com/repo/OracleLinux/OL9/UEKR7/x86_64/index_src.html"
+    )
+elif [ "$EL_VERSION" = "10" ] && [[ "$PACKAGE_BASENAME" == kernel-uek* ]]; then
+    SEARCH_INDEX_PAGES=(
+        "https://yum.oracle.com/repo/OracleLinux/OL10/UEKR8/x86_64/index_src.html"
+    )
+fi
+
 echo "======================================"
 echo "Oracle Linux $EL_VERSION SRPM 다운로드 및 빌드"
 echo "======================================"
@@ -234,6 +268,59 @@ find_latest_exact_srpm_in_html() {
         | tail -1
 }
 
+extract_srpm_hrefs_from_html() {
+    local html="$1"
+
+    echo "$html" | grep -oP "href=['\"]?\K[^'\" >]*\.src\.rpm"
+}
+
+resolve_href_url() {
+    local page_url="$1"
+    local href="$2"
+    local page_dir
+
+    if [[ "$href" =~ ^https?:// ]]; then
+        echo "$href"
+        return 0
+    fi
+
+    page_dir="${page_url%/*}/"
+    echo "${page_dir}${href}"
+}
+
+find_exact_srpm_href_in_html() {
+    local html="$1"
+    local srpm_filename="$2"
+
+    extract_srpm_hrefs_from_html "$html" | while read -r href; do
+        [ -n "$href" ] || continue
+        if [ "$(basename "$href")" = "$srpm_filename" ]; then
+            echo "$href"
+            break
+        fi
+    done
+}
+
+find_latest_exact_srpm_href_in_html() {
+    local html="$1"
+    local pkg_name="$2"
+    local escaped_pkg_name
+
+    escaped_pkg_name=$(escape_regex "$pkg_name")
+
+    extract_srpm_hrefs_from_html "$html" \
+        | while read -r href; do
+            local base
+            [ -n "$href" ] || continue
+            base=$(basename "$href")
+            printf '%s\t%s\n' "$base" "$href"
+        done \
+        | grep -E "^${escaped_pkg_name}-[0-9][^/]*\.src\.rpm[[:space:]]" \
+        | sort -t $'\t' -k1,1V \
+        | tail -1 \
+        | cut -f2-
+}
+
 # 함수: 디렉터리에서 SRPM 파일 검색
 search_srpm_in_directory() {
     local search_url="$1"
@@ -242,17 +329,17 @@ search_srpm_in_directory() {
     local escaped_pkg_name
 
     if [ "$depth" -gt 5 ]; then
-        echo "최대 깊이 도달 (5단계)"
+        echo "최대 깊이 도달 (5단계)" >&2
         return 1
     fi
 
-    echo "  검색 중: $search_url (깊이: $depth)"
+    echo "  검색 중: $search_url (깊이: $depth)" >&2
 
     local html
     html=$(wget -q -O - "$search_url" 2>/dev/null)
 
     if [ -z "$html" ]; then
-        echo "  오류: 페이지 접근 불가"
+        echo "  오류: 페이지 접근 불가" >&2
         return 1
     fi
 
@@ -261,7 +348,7 @@ search_srpm_in_directory() {
     srpm_filename=$(echo "$html" | grep -oP "href=['\"]?\K[^'\" ]*\.src\.rpm" | grep -E "^${escaped_pkg_name}(\.src\.rpm|-.*\.src\.rpm)$" | head -1)
 
     if [ -n "$srpm_filename" ]; then
-        echo "  발견: $srpm_filename"
+        echo "  발견: $srpm_filename" >&2
         echo "${search_url}${srpm_filename}"
         return 0
     fi
@@ -272,8 +359,10 @@ search_srpm_in_directory() {
     if [ -n "$subdirs" ]; then
         for subdir in $subdirs; do
             local new_url="${search_url}${subdir}"
-            search_srpm_in_directory "$new_url" "$pkg_name" $((depth + 1))
-            if [ $? -eq 0 ]; then
+            local nested_result
+            nested_result=$(search_srpm_in_directory "$new_url" "$pkg_name" $((depth + 1)))
+            if [ -n "$nested_result" ]; then
+                echo "$nested_result"
                 return 0
             fi
         done
@@ -461,6 +550,19 @@ if [ -n "$PACKAGE_NAME" ] && wget --spider -q "$BASE_URL${PACKAGE_NAME}.src.rpm"
     SRPM_URL="${BASE_URL}${SRPM_FILE}"
     echo "기본 위치에서 발견: $SRPM_URL"
 
+# 상세 버전 입력: UEK on OL8 source index fallback
+elif [ -n "$PACKAGE_NAME" ] && [ "${#SEARCH_INDEX_PAGES[@]}" -gt 0 ]; then
+    for search_page in "${SEARCH_INDEX_PAGES[@]}"; do
+        page_html=$(wget -q -O - "$search_page" 2>/dev/null)
+        href_match=$(find_exact_srpm_href_in_html "$page_html" "${PACKAGE_NAME}.src.rpm")
+        if [ -n "$href_match" ]; then
+            SRPM_URL=$(resolve_href_url "$search_page" "$href_match")
+            SRPM_FILE=$(basename "$href_match")
+            echo "추가 저장소에서 발견: $SRPM_URL"
+            break
+        fi
+    done
+
 # 패키지명만 입력: 기본 저장소에서 최신 버전 자동 선택
 elif [ -z "$PACKAGE_NAME" ]; then
     base_html=$(wget -q -O - "$BASE_URL" 2>/dev/null)
@@ -470,6 +572,21 @@ elif [ -z "$PACKAGE_NAME" ]; then
         SRPM_FILE="$latest_srpm"
         SRPM_URL="${BASE_URL}${SRPM_FILE}"
         echo "최신 버전 자동 선택: $SRPM_FILE"
+    elif [ "${#SEARCH_INDEX_PAGES[@]}" -gt 0 ]; then
+        for search_page in "${SEARCH_INDEX_PAGES[@]}"; do
+            page_html=$(wget -q -O - "$search_page" 2>/dev/null)
+            href_match=$(find_latest_exact_srpm_href_in_html "$page_html" "$PACKAGE_BASENAME")
+            if [ -n "$href_match" ]; then
+                SRPM_URL=$(resolve_href_url "$search_page" "$href_match")
+                SRPM_FILE=$(basename "$href_match")
+                echo "추가 저장소에서 최신 버전 자동 선택: $SRPM_FILE"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$SRPM_URL" ]; then
+        :
     else
         echo "기본 위치에서 최신 버전을 찾지 못함. 상위 디렉터리 탐색 중..."
 

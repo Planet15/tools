@@ -185,6 +185,96 @@ find_source_srpm_candidates() {
     printf '%s\n' "${candidates[@]}" | awk '!seen[$0]++'
 }
 
+get_uek_source_index_pages() {
+    local el_version="$1"
+
+    case "$el_version" in
+        5)
+            printf '%s\n' \
+                "https://yum.oracle.com/repo/OracleLinux/OL5/UEK/latest/x86_64/index_src.html"
+            ;;
+        6)
+            printf '%s\n' \
+                "https://yum.oracle.com/repo/OracleLinux/OL6/UEKR4/x86_64/index_src.html" \
+                "https://yum.oracle.com/repo/OracleLinux/OL6/UEKR3/latest/x86_64/index_src.html" \
+                "https://yum.oracle.com/repo/OracleLinux/OL6/UEK/latest/x86_64/index_src.html"
+            ;;
+        7)
+            printf '%s\n' \
+                "https://yum.oracle.com/repo/OracleLinux/OL7/UEKR6/x86_64/index_src.html" \
+                "https://yum.oracle.com/repo/OracleLinux/OL7/UEKR5/x86_64/index_src.html" \
+                "https://yum.oracle.com/repo/OracleLinux/OL7/UEKR4/x86_64/index_src.html"
+            ;;
+        8)
+            printf '%s\n' \
+                "https://yum.oracle.com/repo/OracleLinux/OL8/UEKR7/x86_64/index_src.html" \
+                "https://yum.oracle.com/repo/OracleLinux/OL8/UEKR6/x86_64/index_src.html"
+            ;;
+        9)
+            printf '%s\n' \
+                "https://yum.oracle.com/repo/OracleLinux/OL9/UEKR8/x86_64/index_src.html" \
+                "https://yum.oracle.com/repo/OracleLinux/OL9/UEKR7/x86_64/index_src.html"
+            ;;
+        10)
+            printf '%s\n' \
+                "https://yum.oracle.com/repo/OracleLinux/OL10/UEKR8/x86_64/index_src.html"
+            ;;
+    esac
+}
+
+extract_srpm_hrefs_from_html() {
+    local html="$1"
+
+    echo "$html" | grep -oP "href=['\"]?\K[^'\" >]*\.src\.rpm"
+}
+
+resolve_href_url() {
+    local page_url="$1"
+    local href="$2"
+    local page_dir
+
+    if [[ "$href" =~ ^https?:// ]]; then
+        echo "$href"
+        return 0
+    fi
+
+    page_dir="${page_url%/*}/"
+    echo "${page_dir}${href}"
+}
+
+find_exact_srpm_href_in_html() {
+    local html="$1"
+    local srpm_filename="$2"
+
+    extract_srpm_hrefs_from_html "$html" | while read -r href; do
+        [ -n "$href" ] || continue
+        if [ "$(basename "$href")" = "$srpm_filename" ]; then
+            echo "$href"
+            break
+        fi
+    done
+}
+
+find_latest_exact_srpm_href_in_html() {
+    local html="$1"
+    local pkg_name="$2"
+    local escaped_pkg_name
+
+    escaped_pkg_name=$(printf '%s' "$pkg_name" | sed -e 's/[][(){}.^$*+?|\\/]/\\&/g')
+
+    extract_srpm_hrefs_from_html "$html" \
+        | while read -r href; do
+            local base
+            [ -n "$href" ] || continue
+            base=$(basename "$href")
+            printf '%s\t%s\n' "$base" "$href"
+        done \
+        | grep -E "^${escaped_pkg_name}-[0-9][^/]*\.src\.rpm[[:space:]]" \
+        | sort -t $'\t' -k1,1V \
+        | tail -1 \
+        | cut -f2-
+}
+
 resolve_existing_rpms() {
     local base_url="$1"
     shift
@@ -590,6 +680,7 @@ DEBUGINFO_EXTRACT_DIR=""
 SOURCE_TOPDIR=""
 KERNEL_SOURCE_DIR=""
 ANALYSIS_ENV_FILE="${WORKSPACE_DIR}/analysis.env"
+SEARCH_INDEX_PAGES=()
 
 log "[1/9] Preparing vmcore in workspace..."
 
@@ -629,6 +720,10 @@ DOWNLOAD_DIR="${WORKSPACE_DIR}/downloads/${OS_RELEASE}"
 DEBUGINFO_EXTRACT_DIR="${WORKSPACE_DIR}/debug/${OS_RELEASE}"
 SOURCE_TOPDIR="${WORKSPACE_DIR}/source_rpmbuild/${OS_RELEASE}"
 KERNEL_SOURCE_DIR="${WORKSPACE_DIR}/kernel-source/${OS_RELEASE}"
+
+if [ "$KERNEL_FLAVOR" = "uek" ]; then
+    mapfile -t SEARCH_INDEX_PAGES < <(get_uek_source_index_pages "$EL_VERSION")
+fi
 
 mkdir -p "$DOWNLOAD_DIR"
 
@@ -691,16 +786,46 @@ if [ -n "$SOURCE_DIR_OVERRIDE" ]; then
 else
     mapfile -t SOURCE_CANDIDATES < <(find_source_srpm_candidates "$OS_RELEASE" "$KERNEL_FLAVOR")
     mapfile -t SOURCE_SRPMS < <(resolve_existing_rpms "$SRPM_URL" "${SOURCE_CANDIDATES[@]}")
+
+    if [ "${#SOURCE_SRPMS[@]}" -eq 0 ] && [ "${#SEARCH_INDEX_PAGES[@]}" -gt 0 ]; then
+        for search_page in "${SEARCH_INDEX_PAGES[@]}"; do
+            page_html=$(fetch_url "$search_page" 2>/dev/null || true)
+            [ -n "$page_html" ] || continue
+
+            source_href=""
+            for source_candidate in "${SOURCE_CANDIDATES[@]}"; do
+                source_href=$(find_exact_srpm_href_in_html "$page_html" "$source_candidate")
+                if [ -n "$source_href" ]; then
+                    break
+                fi
+            done
+
+            if [ -z "$source_href" ]; then
+                source_href=$(find_latest_exact_srpm_href_in_html "$page_html" "kernel-uek")
+            fi
+
+            if [ -n "$source_href" ]; then
+                SOURCE_SRPMS=("$(resolve_href_url "$search_page" "$source_href")")
+                break
+            fi
+        done
+    fi
+
     [ "${#SOURCE_SRPMS[@]}" -gt 0 ] || fail "No matching source SRPM found for ${OS_RELEASE}"
 
     SOURCE_SRPM_FILE="${SOURCE_SRPMS[0]}"
-    if [ ! -f "${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}" ]; then
-        download_file "${SRPM_URL}${SOURCE_SRPM_FILE}" "${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}" || fail "Source SRPM download failed: ${SOURCE_SRPM_FILE}"
+    SOURCE_SRPM_NAME=$(basename "$SOURCE_SRPM_FILE")
+    if [ ! -f "${DOWNLOAD_DIR}/${SOURCE_SRPM_NAME}" ]; then
+        if [[ "$SOURCE_SRPM_FILE" =~ ^https?:// ]]; then
+            download_file "$SOURCE_SRPM_FILE" "${DOWNLOAD_DIR}/${SOURCE_SRPM_NAME}" || fail "Source SRPM download failed: ${SOURCE_SRPM_FILE}"
+        else
+            download_file "${SRPM_URL}${SOURCE_SRPM_FILE}" "${DOWNLOAD_DIR}/${SOURCE_SRPM_NAME}" || fail "Source SRPM download failed: ${SOURCE_SRPM_FILE}"
+        fi
     else
-        log "Reusing downloaded source SRPM: ${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}"
+        log "Reusing downloaded source SRPM: ${DOWNLOAD_DIR}/${SOURCE_SRPM_NAME}"
     fi
 
-    SOURCE_RPM_ABS="${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}"
+    SOURCE_RPM_ABS="${DOWNLOAD_DIR}/${SOURCE_SRPM_NAME}"
     if [ -d "$KERNEL_SOURCE_DIR" ] && [ -n "$(find "$KERNEL_SOURCE_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)" ]; then
         log "Reusing prepared kernel source tree: $KERNEL_SOURCE_DIR"
     else
