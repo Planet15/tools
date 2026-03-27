@@ -306,6 +306,103 @@ KERNEL_SOURCE_DIR="${KERNEL_SOURCE_DIR}"
 EOF
 }
 
+syscall_name_from_nr() {
+    local nr="$1"
+
+    case "$nr" in
+        0) echo "read" ;;
+        1) echo "write" ;;
+        2) echo "open" ;;
+        3) echo "close" ;;
+        9) echo "mmap" ;;
+        16) echo "ioctl" ;;
+        19) echo "readv" ;;
+        20) echo "writev" ;;
+        39) echo "getpid" ;;
+        59) echo "execve" ;;
+        60) echo "exit" ;;
+        61) echo "wait4" ;;
+        62) echo "kill" ;;
+        72) echo "fcntl" ;;
+        202) echo "futex" ;;
+        217) echo "getdents64" ;;
+        257) echo "openat" ;;
+        262) echo "newfstatat" ;;
+        263) echo "unlinkat" ;;
+        267) echo "readlinkat" ;;
+        268) echo "fchmodat" ;;
+        269) echo "faccessat" ;;
+        291) echo "epoll_create1" ;;
+        292) echo "dup3" ;;
+        293) echo "pipe2" ;;
+        294) echo "inotify_init1" ;;
+        302) echo "prlimit64" ;;
+        313) echo "finit_module" ;;
+        *) echo "" ;;
+    esac
+}
+
+append_register_analysis() {
+    local bt_file="$1"
+    local out_file="$2"
+    local orig_rax
+    local syscall_name
+    local rax rdi rsi rdx r10 r8 r9 rip rsp
+
+    orig_rax=$(sed -nE 's/^[[:space:]]*ORIG_RAX:[[:space:]]*([0-9a-fx]+).*/\1/p' "$bt_file" | head -1)
+    rip=$(sed -nE 's/^[[:space:]]*RIP:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    rsp=$(sed -nE 's/^[[:space:]]*RIP:.*RSP:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    rax=$(sed -nE 's/^[[:space:]]*RAX:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    rdi=$(sed -nE 's/^[[:space:]]*RAX:.*RDI:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    rsi=$(sed -nE 's/^[[:space:]]*RDX:.*RSI:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    rdx=$(sed -nE 's/^[[:space:]]*RDX:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    r10=$(sed -nE 's/^[[:space:]]*R10:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    r8=$(sed -nE 's/^[[:space:]]*RBP:.*R8:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+    r9=$(sed -nE 's/^[[:space:]]*R8:.*R9:[[:space:]]*([^[:space:]]+).*/\1/p' "$bt_file" | head -1)
+
+    syscall_name=""
+    if [[ "$orig_rax" =~ ^[0-9]+$ ]]; then
+        syscall_name=$(syscall_name_from_nr "$orig_rax")
+    elif [[ "$orig_rax" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        syscall_name=$(syscall_name_from_nr "$((orig_rax))")
+    fi
+
+    {
+        echo "## Register Context"
+        echo ""
+        [ -n "$rip" ] && echo "- user RIP: ${rip}"
+        [ -n "$rsp" ] && echo "- user RSP: ${rsp}"
+        [ -n "$rax" ] && echo "- current RAX: ${rax}"
+        if [ -n "$orig_rax" ]; then
+            if [ -n "$syscall_name" ]; then
+                echo "- ORIG_RAX: ${orig_rax} (${syscall_name} syscall)"
+            else
+                echo "- ORIG_RAX: ${orig_rax}"
+            fi
+        fi
+        echo ""
+        echo "### Register Interpretation"
+        echo ""
+        [ -n "$rdi" ] && echo "- RDI: first syscall argument = ${rdi}"
+        [ -n "$rsi" ] && echo "- RSI: second syscall argument = ${rsi}"
+        [ -n "$rdx" ] && echo "- RDX: third syscall argument = ${rdx}"
+        [ -n "$r10" ] && echo "- R10: fourth syscall argument = ${r10}"
+        [ -n "$r8" ] && echo "- R8: fifth syscall argument = ${r8}"
+        [ -n "$r9" ] && echo "- R9: sixth syscall argument = ${r9}"
+        echo ""
+        echo "### Recommended Follow-up"
+        echo ""
+        if [ -n "$orig_rax" ] && [ -n "$syscall_name" ]; then
+            echo "- Treat this frame as a ${syscall_name} syscall entry context first, then confirm the kernel-side call path."
+        fi
+        [ -n "$rsi" ] && echo "- Inspect the user buffer candidate with: \`rd -a ${rsi}\` and \`rd -8 ${rsi} 16\`"
+        [ -n "$rsp" ] && echo "- Inspect the user stack vicinity with: \`rd -8 ${rsp} 32\`"
+        [ -n "$rip" ] && echo "- Keep the user-space instruction pointer in mind when correlating this with process mappings: \`${rip}\`"
+        echo "- Prefer ORIG_RAX over current RAX when inferring the original syscall number."
+        echo ""
+    } >> "$out_file"
+}
+
 extract_function_source() {
     local func_name="$1"
     local out_file="$2"
@@ -402,6 +499,8 @@ generate_code_trace() {
         echo "- bt -f output: bt_full.txt"
         echo ""
     } > "$trace_file"
+
+    append_register_analysis "$bt_file" "$trace_file"
 
     while IFS= read -r line; do
         case "$line" in
