@@ -380,10 +380,12 @@ generate_code_trace() {
     local frame_addr
     local module_name
     local trailing_bracket
+    local exception_site
 
     trigger_header=$(grep -m 1 '^PID:' "$bt_file" || true)
     trigger_pid=$(printf '%s\n' "$trigger_header" | sed -nE 's/^PID:[[:space:]]*([0-9]+).*/\1/p')
     trigger_cmd=$(printf '%s\n' "$trigger_header" | sed -nE 's/^PID:.*COMMAND:[[:space:]]*"([^"]+)".*/\1/p')
+    exception_site=$(sed -nE 's/^[[:space:]]*\[exception RIP:[[:space:]]*([^]]+)\].*/\1/p' "$bt_file" | head -1)
 
     {
         echo "# Code Trace"
@@ -393,6 +395,7 @@ generate_code_trace() {
         echo "- source: ${KERNEL_SOURCE_DIR}"
         [ -n "$trigger_pid" ] && echo "- trigger pid: ${trigger_pid}"
         [ -n "$trigger_cmd" ] && echo "- trigger command: ${trigger_cmd}"
+        [ -n "$exception_site" ] && echo "- exception RIP: ${exception_site}"
         echo ""
         echo "## Raw Trace Source"
         echo ""
@@ -402,10 +405,10 @@ generate_code_trace() {
 
     while IFS= read -r line; do
         case "$line" in
-            \#*)
-                frame_no=$(printf '%s\n' "$line" | sed -nE 's/^#([0-9]+).*/\1/p')
-                func_name=$(printf '%s\n' "$line" | sed -nE 's/^#[0-9]+ \[[^]]+\] ([^[:space:]]+).*/\1/p')
-                frame_addr=$(printf '%s\n' "$line" | sed -nE 's/^#[0-9]+ \[([^]]+)\].*/\1/p')
+            [[:space:]]\#*|\#*)
+                frame_no=$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*#([0-9]+).*/\1/p')
+                func_name=$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*#[0-9]+ \[[^]]+\] ([^[:space:]]+).*/\1/p')
+                frame_addr=$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*#[0-9]+ \[([^]]+)\].*/\1/p')
                 trailing_bracket=$(printf '%s\n' "$line" | grep -oE '\[[^]]+\]$' | tr -d '[]' || true)
                 module_name=""
                 if [ -n "$trailing_bracket" ] && [ "$trailing_bracket" != "$frame_addr" ]; then
@@ -519,30 +522,41 @@ else
     for rpm_name in "${DEBUGINFO_RPMS[@]}"; do
         if [ ! -f "${DOWNLOAD_DIR}/${rpm_name}" ]; then
             download_file "${DEBUGINFO_URL}${rpm_name}" "${DOWNLOAD_DIR}/${rpm_name}" || fail "RPM download failed: ${rpm_name}"
+        else
+            log "Reusing downloaded RPM: ${DOWNLOAD_DIR}/${rpm_name}"
         fi
     done
 
-    rm -rf "$DEBUGINFO_EXTRACT_DIR"
-    mkdir -p "$DEBUGINFO_EXTRACT_DIR"
     VMLINUX_REL=""
 
     for rpm_name in "${DEBUGINFO_RPMS[@]}"; do
         if [ -z "$VMLINUX_REL" ]; then
             VMLINUX_REL=$(find_vmlinux_relpath_in_rpm "${DOWNLOAD_DIR}/${rpm_name}" || true)
         fi
-        (
-            cd "$DEBUGINFO_EXTRACT_DIR"
-            if [ -n "$VMLINUX_REL" ]; then
-                rpm2cpio "${DOWNLOAD_DIR}/${rpm_name}" | cpio -idm "./${VMLINUX_REL}" "${VMLINUX_REL}" >/dev/null 2>&1 || true
-            fi
-        )
-        extract_vmlinux_from_rpm "${DOWNLOAD_DIR}/${rpm_name}" "$DEBUGINFO_EXTRACT_DIR"
     done
 
     if [ -n "$VMLINUX_REL" ] && [ -f "${DEBUGINFO_EXTRACT_DIR}/${VMLINUX_REL}" ]; then
+        log "Reusing extracted vmlinux: ${DEBUGINFO_EXTRACT_DIR}/${VMLINUX_REL}"
         VMLINUX_ABS="${DEBUGINFO_EXTRACT_DIR}/${VMLINUX_REL}"
     else
-        VMLINUX_ABS=$(find "$DEBUGINFO_EXTRACT_DIR" -type f -path '*/usr/lib/debug/lib/modules/*/vmlinux' | head -1)
+        rm -rf "$DEBUGINFO_EXTRACT_DIR"
+        mkdir -p "$DEBUGINFO_EXTRACT_DIR"
+
+        for rpm_name in "${DEBUGINFO_RPMS[@]}"; do
+            (
+                cd "$DEBUGINFO_EXTRACT_DIR"
+                if [ -n "$VMLINUX_REL" ]; then
+                    rpm2cpio "${DOWNLOAD_DIR}/${rpm_name}" | cpio -idm "./${VMLINUX_REL}" "${VMLINUX_REL}" >/dev/null 2>&1 || true
+                fi
+            )
+            extract_vmlinux_from_rpm "${DOWNLOAD_DIR}/${rpm_name}" "$DEBUGINFO_EXTRACT_DIR"
+        done
+
+        if [ -n "$VMLINUX_REL" ] && [ -f "${DEBUGINFO_EXTRACT_DIR}/${VMLINUX_REL}" ]; then
+            VMLINUX_ABS="${DEBUGINFO_EXTRACT_DIR}/${VMLINUX_REL}"
+        else
+            VMLINUX_ABS=$(find "$DEBUGINFO_EXTRACT_DIR" -type f -path '*/usr/lib/debug/lib/modules/*/vmlinux' | head -1)
+        fi
     fi
 
     [ -n "$VMLINUX_ABS" ] && [ -f "$VMLINUX_ABS" ] || fail "vmlinux extraction failed under: $DEBUGINFO_EXTRACT_DIR"
@@ -560,10 +574,16 @@ else
     SOURCE_SRPM_FILE="${SOURCE_SRPMS[0]}"
     if [ ! -f "$SOURCE_SRPM_FILE" ]; then
         download_file "${SRPM_URL}${SOURCE_SRPM_FILE}" "${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}" || fail "Source SRPM download failed: ${SOURCE_SRPM_FILE}"
+    else
+        log "Reusing downloaded source SRPM: ${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}"
     fi
 
     SOURCE_RPM_ABS="${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}"
-    prepare_source_tree "$SOURCE_RPM_ABS" "$SOURCE_TOPDIR" "$KERNEL_SOURCE_DIR"
+    if [ -d "$KERNEL_SOURCE_DIR" ] && [ -n "$(find "$KERNEL_SOURCE_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | head -1)" ]; then
+        log "Reusing prepared kernel source tree: $KERNEL_SOURCE_DIR"
+    else
+        prepare_source_tree "$SOURCE_RPM_ABS" "$SOURCE_TOPDIR" "$KERNEL_SOURCE_DIR"
+    fi
 fi
 
 write_analysis_env "$ANALYSIS_ENV_FILE"
