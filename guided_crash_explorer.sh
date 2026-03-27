@@ -598,6 +598,8 @@ echo "env      : $ANALYSIS_ENV_FILE"
 if [ "$PREPARE_ONLY" = "on" ]; then
     log ""
     log "Preparation complete."
+    log "Run crash manually with:"
+    log "  crash \"$VMLINUX_ABS\" \"$TARGET_VMCORE\""
     exit 0
 fi
 
@@ -610,5 +612,6 @@ generate_code_trace
 log "[8/9] Generated outputs..."
 echo "bt trace : ${WORKSPACE_DIR}/bt_full.txt"
 echo "report   : ${WORKSPACE_DIR}/code_trace.md"
+echo "crash cmd: crash \"$VMLINUX_ABS\" \"$TARGET_VMCORE\""
 
 log "[9/9] Done."

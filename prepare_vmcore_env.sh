@@ -455,5 +455,8 @@ if [ "$PREPARE_ONLY" = "on" ]; then
 fi
 
 log ""
+log "Prepared crash command:"
+log "  crash \"$VMLINUX_ABS\" \"$TARGET_VMCORE\""
+log ""
 log "Starting crash..."
 exec crash "$VMLINUX_ABS" "$TARGET_VMCORE"
