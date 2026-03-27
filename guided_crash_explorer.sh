@@ -257,7 +257,9 @@ EOF
         fi
 
         if ! rpmbuild --define "_topdir $source_topdir" -bp "$source_topdir/SPECS/$(basename "$spec_file")" --nodeps >>"$prep_log" 2>&1; then
-            [ "$shim_created" = "on" ] && rm -f "$shim_path"
+            if [ "$shim_created" = "on" ]; then
+                rm -f "$shim_path"
+            fi
             fail "rpmbuild -bp failed for source SRPM: $srpm_file (see $prep_log)"
         fi
     fi
@@ -405,15 +407,26 @@ append_register_analysis() {
 
 extract_function_source() {
     local func_name="$1"
-    local out_file="$2"
+    local instr_addr="$2"
+    local out_file="$3"
     local gdb_output
     local source_file
     local source_line
     local local_source
     local start_line
     local end_line
+    local source_label
 
-    gdb_output=$(gdb -batch "$VMLINUX_ABS" -ex "directory $KERNEL_SOURCE_DIR" -ex "info line ${func_name}" 2>/dev/null || true)
+    if [ -n "$instr_addr" ]; then
+        gdb_output=$(gdb -batch "$VMLINUX_ABS" -ex "directory $KERNEL_SOURCE_DIR" -ex "info line *${instr_addr}" 2>/dev/null || true)
+    else
+        gdb_output=""
+    fi
+
+    if [ -z "$gdb_output" ]; then
+        gdb_output=$(gdb -batch "$VMLINUX_ABS" -ex "directory $KERNEL_SOURCE_DIR" -ex "info line ${func_name}" 2>/dev/null || true)
+    fi
+
     if [ -z "$gdb_output" ]; then
         return 0
     fi
@@ -441,8 +454,14 @@ extract_function_source() {
     end_line=$((source_line + 5))
     [ "$start_line" -lt 1 ] && start_line=1
 
+    if [ -n "$instr_addr" ]; then
+        source_label="${source_file}:${source_line} (resolved from ${instr_addr})"
+    else
+        source_label="${source_file}:${source_line}"
+    fi
+
     {
-        echo "Source: ${source_file}:${source_line}"
+        echo "Source: ${source_label}"
         echo ""
         echo '```c'
         nl -ba "$local_source" | sed -n "${start_line},${end_line}p"
@@ -475,6 +494,7 @@ generate_code_trace() {
     local frame_no
     local func_name
     local frame_addr
+    local instr_addr
     local module_name
     local trailing_bracket
     local exception_site
@@ -508,6 +528,7 @@ generate_code_trace() {
                 frame_no=$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*#([0-9]+).*/\1/p')
                 func_name=$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*#[0-9]+ \[[^]]+\] ([^[:space:]]+).*/\1/p')
                 frame_addr=$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*#[0-9]+ \[([^]]+)\].*/\1/p')
+                instr_addr=$(printf '%s\n' "$line" | sed -nE 's/.* at ([[:xdigit:]]{8,}|0x[[:xdigit:]]+).*/\1/p')
                 trailing_bracket=$(printf '%s\n' "$line" | grep -oE '\[[^]]+\]$' | tr -d '[]' || true)
                 module_name=""
                 if [ -n "$trailing_bracket" ] && [ "$trailing_bracket" != "$frame_addr" ]; then
@@ -523,11 +544,13 @@ generate_code_trace() {
                     echo "## Frame ${frame_no}: ${func_name}"
                     echo ""
                     [ -n "$frame_addr" ] && echo "- stack frame: ${frame_addr}"
+                    [ -n "$instr_addr" ] && echo "- instruction address: ${instr_addr}"
                     if [ -n "$module_name" ] && [ "$module_name" != "$func_name" ]; then
                         echo "- module: ${module_name}"
                     fi
                     echo "- recommended crash commands:"
                     echo "  - \`dis ${func_name}\`"
+                    [ -n "$instr_addr" ] && echo "  - \`dis -l ${instr_addr}\`"
                     if [ -n "$trigger_pid" ]; then
                         echo "  - \`bt -f ${trigger_pid}\`"
                     fi
@@ -538,7 +561,7 @@ generate_code_trace() {
                     echo ""
                 } >> "$trace_file"
 
-                extract_function_source "$func_name" "$trace_file" || true
+                extract_function_source "$func_name" "$instr_addr" "$trace_file" || true
                 echo "" >> "$trace_file"
                 ;;
         esac
@@ -671,7 +694,7 @@ else
     [ "${#SOURCE_SRPMS[@]}" -gt 0 ] || fail "No matching source SRPM found for ${OS_RELEASE}"
 
     SOURCE_SRPM_FILE="${SOURCE_SRPMS[0]}"
-    if [ ! -f "$SOURCE_SRPM_FILE" ]; then
+    if [ ! -f "${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}" ]; then
         download_file "${SRPM_URL}${SOURCE_SRPM_FILE}" "${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}" || fail "Source SRPM download failed: ${SOURCE_SRPM_FILE}"
     else
         log "Reusing downloaded source SRPM: ${DOWNLOAD_DIR}/${SOURCE_SRPM_FILE}"
